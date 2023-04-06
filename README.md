@@ -64,4 +64,4 @@ To avoid incurring future charges, delete the resources you created:
 
 1.	On the AWS Backup console, [delete the recovery points](https://docs.aws.amazon.com/aws-backup/latest/devguide/gs-cleanup-resources.html#cleanup-backups).
 2.	On the Amazon S3 console, [empty the S3 bucket](https://docs.aws.amazon.com/AmazonS3/latest/userguide/empty-bucket.html) created by the CloudFormation template to store the RDS database exports.
-3.	On the AWS CloudFormation console, [delete the stacks](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/cfn-console-delete-stack.html) that you created for the solution and RDS instance.
+3.	On the AWS CloudFormation console, [delete the stack](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/cfn-console-delete-stack.html) that you created for the solution.
