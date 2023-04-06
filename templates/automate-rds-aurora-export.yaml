@@ -1,0 +1,734 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
+AWSTemplateFormatVersion: 2010-09-09
+
+Metadata: 
+  AWS::CloudFormation::Interface: 
+    ParameterGroups: 
+      - 
+        Label: 
+          default: KMS Key Configuration
+        Parameters: 
+        - CreateKmsKey
+        - KmsKeyId
+      -
+        Label:
+          default: RDS Export Configuration
+        Parameters:
+          - NotificationEmail
+          - ExportOnly
+          - RunGlueCrawler
+
+    ParameterLabels: 
+      CreateKmsKey:
+        default: 'Do you want a new KMS Key to be created that will be used to encrypy/decrypt RDS exports?'
+      KmsKeyId:
+        default: 'What is the KMS Key ID that you want to be used?'
+      ExportOnly:
+        default: 'Do you want to export only specific schemes, databases or tables?'
+      NotificationEmail:
+        default: 'Type a valid email address to be used for notifications'
+      RunGlueCrawler:
+        default: 'Do you want your database exports to be available in Athena automatically after each export?'
+
+Parameters:
+  CreateKmsKey:
+    AllowedValues:
+      - 'Yes'
+      - 'No'
+    Default: 'Yes'
+    Type: String
+    Description: 'If you choose Yes, we will create a new KMS key for you to be used in RDS Exports.'
+  KmsKeyId:
+    Type: String
+    Description: 'If you choose No for KMS key creation, it is mandatory to enter a valid KMS key ID. You need to define key users manually.'
+  ExportOnly:
+    Type: String
+    Description: 'You can put scheme, database or table names in a comma-separated list. Otherwise leave it blank for all data to be exported. See: https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/rds/client/start_export_task.html#RDS.Client.start_export_task'
+  NotificationEmail:
+    Type: String
+    AllowedPattern: '[^@]+@[^@]+\.[^@]+'
+    ConstraintDescription: 'Please enter a valid email address.'
+    Description: 'You will receive notification when S3 export task failed.'
+  RunGlueCrawler:
+    AllowedValues:
+      - 'Yes'
+      - 'No'
+    Default: 'Yes'
+    Type: String
+    Description: 'If you choose Yes, we will create a Glue database, table(s), crawler and run it followed by each export so you can query data using Athena.'
+
+Conditions:
+  CreateKmsKeyCondition: !Equals [!Ref CreateKmsKey, 'Yes']
+  RunGlueCrawlerCondition: !Equals [!Ref RunGlueCrawler, 'Yes']
+
+Outputs:
+  IamRoleForLambdaBackupCompleted: 
+    Description: IAM Role Name of the Lambda which triggered after AWS Backup completed.
+    Value: !Ref ProcessBackupCompletionNotificationRole
+  IamRoleForLambdaExportCompleted:
+    Description: IAM Role Name of the Lambda which triggered after RDS Export completed.
+    Value: !Ref ProcessRdsExportCompletedNotificationRole
+  IamRoleForGlueService:
+    Description: IAM Role Name used by AWS Glue Service.
+    Value: !Ref GlueRole
+  BackupVaultName:
+    Description: The name of the AWS Backup vault that should be used for automatically exporting the desired databases.
+    Value: !Ref BackupVault
+  SnsTopicName:
+    Description: The name of the SNS Topic which you can use to receive notifications after any RDS export failed.
+    Value: !GetAtt RdsExportFailedTopic.TopicName
+
+Resources:
+  #BACKUP--
+  BackupVault:
+    Type: AWS::Backup::BackupVault
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BackupVaultName: !Join ['-', ['AutoExportDB-vault', !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+      EncryptionKeyArn: !If [CreateKmsKeyCondition, !GetAtt KmsKey.Arn, !Sub 'arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/${KmsKeyId}']
+
+  #KMS-----
+  KmsKey:
+    Type: AWS::KMS::Key
+    Condition: CreateKmsKeyCondition
+    Properties:
+      Description: !Sub 'Created by Auto-RDS-Export CF Stack: ${AWS::StackId}'
+      EnableKeyRotation: true
+      Enabled: true
+      KeyPolicy:
+        Id: key-consolepolicy-3
+        Version: '2012-10-17'
+        Statement:
+        - Sid: Enable IAM User Permissions
+          Effect: Allow
+          Principal:
+            AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+          Action: kms:*
+          Resource: "*"
+        - Sid: Allow use of the key
+          Effect: Allow
+          Principal:
+            AWS:
+            - !GetAtt ProcessBackupCompletionNotificationRole.Arn
+            - !GetAtt RdsExportRole.Arn
+            - !GetAtt GlueRole.Arn
+          Action:
+          - kms:Encrypt
+          - kms:Decrypt
+          - kms:ReEncrypt*
+          - kms:GenerateDataKey*
+          - kms:DescribeKey
+          Resource: "*"
+        - Sid: Allow attachment of persistent resources
+          Effect: Allow
+          Principal:
+            AWS:
+            - !GetAtt ProcessBackupCompletionNotificationRole.Arn
+            - !GetAtt RdsExportRole.Arn
+          Action:
+          - kms:CreateGrant
+          - kms:ListGrants
+          - kms:RevokeGrant
+          Resource: "*"
+          Condition:
+            Bool:
+              kms:GrantIsForAWSResource: 'true'
+
+  
+  #S3-----
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties: 
+      AccessControl: Private
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'aws:kms'
+              KMSMasterKeyID: !If [CreateKmsKeyCondition, !GetAtt KmsKey.Arn, !Sub 'arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/${KmsKeyId}']
+      BucketName: !Join ['-', ['autoexportdb', !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+  
+  #IAM-----
+  ProcessBackupCompletionNotificationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Description: 'Lambda Function Role Created by Auto RDS Export CloudFormation Template'
+      Policies:
+        - PolicyName: !Join ['-', ['AutoExportDB-backup-completed-policy', !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action:
+               - logs:CreateLogGroup
+              Resource:
+              - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*"
+            - Effect: Allow
+              Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              Resource:
+               - !Sub
+                - "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${FunctionName}:*"
+                - FunctionName: !Join ['-', ['AutoExportDB-backup-completed', !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+            - Effect: Allow
+              Action:
+              - iam:PassRole
+              Resource:
+              - !GetAtt RdsExportRole.Arn
+            - Effect: Allow
+              Action:
+              - rds:StartExportTask
+              - backup:DescribeBackupJob
+              Resource: "*" #the actions above support all resources
+  
+  ProcessRdsExportCompletedNotificationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Description: 'RDS Export Role Created by Cloudformation'
+      Policies:
+        - PolicyName: !Join ['-', ['AutoExportDB-export-completed-policy', !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action:
+               - logs:CreateLogGroup
+              Resource:
+              - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*"
+            - Effect: Allow
+              Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              Resource:
+               - !Sub
+                - "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${FunctionName}:*"
+                - FunctionName: !Join ['-', ['AutoExportDB-export-completed', !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+            - Effect: Allow
+              Action:
+              - iam:PassRole
+              - glue:CreateDatabase
+              - glue:StartCrawler
+              Resource:
+              - !GetAtt GlueRole.Arn
+              - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+              - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/*"
+              - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:crawler/*"
+            - Effect: Allow
+              Action:
+              - rds:DescribeExportTasks #this action supports all resources
+              - rds:DescribeRecommendationGroups #this action supports all resources
+              - glue:CreateCrawler #this action supports all resources
+              - rds:DescribeRecommendations #this action supports all resources
+              Resource: "*"
+            - Effect: Allow
+              Action:
+              - rds:DescribeDBClusterSnapshots
+              - rds:DownloadCompleteDBLogFile
+              - rds:DownloadDBLogFilePortion
+              - rds:DescribeDBSnapshots
+              - rds:ListTagsForResource
+              Resource:
+              - !Sub "arn:${AWS::Partition}:rds:*:${AWS::AccountId}:cluster-snapshot:*"
+              - !Sub "arn:${AWS::Partition}:rds:*:${AWS::AccountId}:db:*"
+              - !Sub "arn:${AWS::Partition}:rds:*:${AWS::AccountId}:snapshot:*"
+              - !Sub "arn:${AWS::Partition}:rds:*:${AWS::AccountId}:cluster:*"
+  
+  RdsExportRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - export.rds.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Description: 'Lambda Function Role Created by Auto RDS Export CloudFormation Template'
+      Policies:
+        - PolicyName: !Join ['-', ['rds-export-policy', !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action:
+              - kms:Decrypt
+              - kms:Encrypt
+              - kms:GenerateDataKey
+              - kms:ReEncryptTo
+              - kms:GenerateDataKeyWithoutPlaintext
+              - kms:DescribeKey
+              - kms:RetireGrant
+              - kms:CreateGrant
+              - kms:ReEncryptFrom
+              Resource: !Sub 'arn:${AWS::Partition}:kms:*:${AWS::AccountId}:key/*'
+            - Effect: Allow
+              Action:
+              - s3:ListBucket
+              - s3:GetBucketLocation
+              Resource:
+              - !Sub 
+                - 'arn:${AWS::Partition}:s3:::${BucketName}'
+                - BucketName: !Join ['-', ['autoexportdb', !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+            - Effect: Allow
+              Action:
+              - s3:PutObject*
+              - s3:GetObject*
+              - s3:DeleteObject*
+              Resource:
+              - !Sub 
+                - 'arn:${AWS::Partition}:s3:::${BucketName}/*'
+                - BucketName: !Join ['-', ['autoexportdb', !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+
+  
+  GlueRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - glue.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Description: 'Glue Role Created by Cloudformation'
+      Policies:
+        - PolicyName: !Join ['-', ['glue-policy', !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+          PolicyDocument: # the policy below used per https://docs.aws.amazon.com/glue/latest/dg/create-service-policy.html
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action:
+              - glue:*
+              - s3:GetBucketLocation
+              - s3:ListBucket
+              - s3:ListAllMyBuckets
+              - s3:GetBucketAcl
+              - ec2:DescribeVpcEndpoints
+              - ec2:DescribeRouteTables
+              - ec2:CreateNetworkInterface
+              - ec2:DeleteNetworkInterface
+              - ec2:DescribeNetworkInterfaces
+              - ec2:DescribeSecurityGroups
+              - ec2:DescribeSubnets
+              - ec2:DescribeVpcAttribute
+              - iam:ListRolePolicies
+              - iam:GetRole
+              - iam:GetRolePolicy
+              - cloudwatch:PutMetricData
+              Resource:
+              - "*"
+            - Effect: Allow
+              Action:
+              - s3:CreateBucket
+              Resource:
+              - arn:aws:s3:::aws-glue-*
+            - Effect: Allow
+              Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:DeleteObject
+              Resource:
+              - arn:aws:s3:::aws-glue-*/*
+              - arn:aws:s3:::*/*aws-glue-*/*
+            - Effect: Allow
+              Action:
+              - s3:GetObject
+              Resource:
+              - arn:aws:s3:::crawler-public*
+              - arn:aws:s3:::aws-glue-*
+            - Effect: Allow
+              Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              Resource:
+              - arn:aws:logs:*:*:/aws-glue/*
+            - Effect: Allow
+              Action:
+              - ec2:CreateTags
+              - ec2:DeleteTags
+              Condition:
+                ForAllValues:StringEquals:
+                  aws:TagKeys:
+                  - aws-glue-service-resource
+              Resource:
+              - arn:aws:ec2:*:*:network-interface/*
+              - arn:aws:ec2:*:*:security-group/*
+              - arn:aws:ec2:*:*:instance/*
+            - Effect: Allow
+              Action:
+              - kms:CreateAlias
+              - kms:CreateKey
+              - kms:DeleteAlias
+              - kms:Describe*
+              - kms:GenerateRandom
+              - kms:Get*
+              - kms:List*
+              - kms:TagResource
+              - kms:UntagResource
+              - iam:ListGroups
+              - iam:ListRoles
+              - iam:ListUsers
+              Resource: "*"
+            - Effect: Allow
+              Action:
+              - s3:*
+              - s3-object-lambda:*
+              Resource: "*"
+
+##Lambda/////
+  ProcessRdsExportCompletedNotification:
+    Type: AWS::Lambda::Function
+    Condition: RunGlueCrawlerCondition
+    Properties:
+      Description: Processes RDS Export completion event, initiates Glue tasks.
+      FunctionName: !Join ['-', ['AutoExportDB-export-completed', !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+      Handler: "index.lambda_handler"
+      MemorySize: 128
+      Role: !GetAtt ProcessRdsExportCompletedNotificationRole.Arn
+      Runtime: python3.9
+      Timeout: 15
+      Environment:
+        Variables:
+          GLUE_IAM_ROLE_ARN: !GetAtt GlueRole.Arn
+          S3_BUCKET_NAME: !Join ['-', ['autoexportdb', !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+
+          LOG_LEVEL: 'INFO'
+      Code:
+        ZipFile: |
+          import logging
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+          from botocore.exceptions import ClientError
+
+          """
+          The Event Bridge rule triggers this Lambda function when the export task is completed.
+          It works for RDS and Aurora databases.
+          It creates Glue database, crawler and runs it to make the export available in Athena.
+          It checks s3 bucket of the export task for validation, otherwise it would create glue database for all database exports.
+          """
+
+          #configure logger
+          logger = logging.getLogger()
+          logger.setLevel(os.getenv("LOG_LEVEL", logging.INFO))
+
+          #initiate boto3
+          session = boto3.Session()
+          rds_client = session.client('rds')
+          glue_client = session.client('glue')
+
+          def validate_env_var(var_name):
+            value = os.environ.get(var_name)
+            if not value:
+                logger.error(f"ERROR: Environment variable '{var_name}' not set.")
+                sys.exit(1)
+            return value
+            
+          def lambda_handler(event, context):
+            logger.info(event)
+            source_arn = event['detail']['SourceArn']
+            source_identifier = event['detail']['SourceIdentifier']
+            s3_bucket = validate_env_var('S3_BUCKET_NAME')
+            glue_iam_role_arn = validate_env_var('GLUE_IAM_ROLE_ARN')
+            source_type = event['detail']['SourceType']
+            #Validate if we need to continue with glue operations for the export task 
+            response = rds_client.describe_export_tasks(
+                SourceArn=source_arn,
+                Filters=[
+                    {'Name': 'status', 'Values': ['complete']},
+                    {'Name': 's3-bucket', 'Values': [s3_bucket]}
+                ],
+            )
+            
+            export_tasks = response['ExportTasks']
+            if len(export_tasks) == 0:
+              logger.error('No Export Task found!')
+              sys.exit(1)
+            
+            export_task_identifier = export_tasks[0]['ExportTaskIdentifier']
+            s3_prefix = export_tasks[0]['S3Prefix']
+            backup_job_id = source_identifier.split('awsbackup:job-')[1]
+            
+            logger.info('ExportTaskIdentifier: %s', export_task_identifier)
+            logger.info('S3Prefix: %s', s3_prefix)
+            logger.info('SourceArn: %s', source_arn)
+            logger.info('SourceIdentifier: %s', source_identifier)
+            logger.info('BackupJobId: %s', backup_job_id)
+            # Check if the source database is RDS
+            if source_type == 'SNAPSHOT':
+              response = rds_client.describe_db_snapshots(
+                  DBSnapshotIdentifier=source_identifier,
+                  SnapshotType='awsbackup',
+              )
+              db_instance_identifier = response['DBSnapshots'][0]['DBInstanceIdentifier']
+              db_engine = response['DBSnapshots'][0]['Engine']
+              db_snapshot_create_time = str(response['DBSnapshots'][0]['SnapshotCreateTime'])
+            # Otherwise the source database can be assumed as Aurora  
+            else:
+              response = rds_client.describe_db_cluster_snapshots(
+                  DBClusterSnapshotIdentifier=source_identifier,
+                  SnapshotType='awsbackup',
+              )
+              db_instance_identifier = response['DBClusterSnapshots'][0]['DBClusterIdentifier']
+              db_engine = response['DBClusterSnapshots'][0]['Engine']
+              db_snapshot_create_time = str(response['DBClusterSnapshots'][0]['SnapshotCreateTime'])
+            
+            d_ss = datetime.strptime(db_snapshot_create_time, '%Y-%m-%d %H:%M:%S.%f%z')
+            
+            logger.info('DBInstanceIdentifier: %s', db_instance_identifier)
+            logger.info('Engine: %s', db_engine)
+            logger.info('SnapshotCreateTime: {}'.format(db_snapshot_create_time))
+            
+            glue_db_suffix = f'{d_ss.year}{d_ss.month:02d}{d_ss.day:02d}{d_ss.hour:02d}{d_ss.minute:02d}'
+            glue_db_name = f'rds_{db_engine}_{db_instance_identifier}_{glue_db_suffix}'
+            
+            response = glue_client.create_database(
+                DatabaseInput={
+                    'Name': glue_db_name,
+                    'Description': 'Database created by Auto RDS Export',
+                }
+            )
+
+            s3_path_for_crawler = f's3://{s3_bucket}/{s3_prefix}/{export_task_identifier}'
+            glue_crawler_name = f'{glue_db_name}_crawler'
+            
+            response = glue_client.create_crawler(
+                Name=glue_crawler_name,
+                Role=glue_iam_role_arn,
+                DatabaseName=glue_db_name,
+                Description='Crawler created by Auto RDS Export',
+                Targets={
+                    'S3Targets': [
+                        {
+                            'Path': s3_path_for_crawler
+                        },
+                    ]
+                },
+            )
+            
+            response = glue_client.start_crawler(Name=glue_crawler_name)
+            
+            if response['ResponseMetadata']['HTTPStatusCode'] == 200:
+              logger.info('I created Glue Database and ran Crawler.')
+            else:
+              logger.error('Failed to start crawler!')
+
+  ProcessBackupCompletionNotification:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Processes backup completion event, initiates RDS export.
+      FunctionName: !Join ['-', ['AutoExportDB-backup-completed', !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+      Handler: "index.lambda_handler"
+      MemorySize: 128
+      Role: !GetAtt ProcessBackupCompletionNotificationRole.Arn
+      Runtime: python3.9
+      Timeout: 15
+      Environment:
+        Variables:
+          EXPORT_ONLY: !Ref ExportOnly
+          IAM_ROLE_ARN: !GetAtt RdsExportRole.Arn
+          KMS_KEY_ID: !If [CreateKmsKeyCondition, !Ref KmsKey, !Ref KmsKeyId ]
+          S3_BUCKET_NAME: !Join ['-', ['autoexportdb', !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+          LOG_LEVEL: 'INFO'
+      Code:
+        ZipFile: |
+          import sys
+          import logging
+          import json
+          import boto3
+          from botocore.exceptions import ClientError
+          import os
+          from datetime import datetime
+
+          """
+          The Event Bridge rule triggers this Lambda function when the AWS Backup task is completed for the backup vault created by the solution.
+          It starts export task for the database received in the event details.
+          """
+
+          #configure logger
+          logger = logging.getLogger()
+          logger.setLevel(os.getenv("LOG_LEVEL", logging.INFO))
+
+          #initiate boto3
+          session = boto3.Session()
+          rds_client = session.client('rds')
+
+          def validate_env_var(var_name):
+            value = os.environ.get(var_name)
+            if not value:
+                logger.error(f"ERROR: Environment variable '{var_name}' not set.")
+                sys.exit(1)
+            return value
+
+          def lambda_handler(event, context):
+            logger.info('Received Event')
+            logger.info(event)
+            creation_date=event['detail']['creationDate']
+            export_task_id='AutoExportDB-' + str(event['detail']['backupJobId']) + '-' + datetime.now().strftime("%S%z")
+            source_arn = event['resources'][0]
+            s3_bucket = validate_env_var('S3_BUCKET_NAME')
+            iam_role= validate_env_var('IAM_ROLE_ARN')
+            kms_key= validate_env_var('KMS_KEY_ID')
+            s3_prefix= str(creation_date.split('T')[0]).replace('-','/')
+            export_only= os.environ.get('EXPORT_ONLY')
+            
+            if len(export_only) > 0:
+                export_only = [ export_only ]
+            else:
+                export_only = list()
+
+            logger.info('Export Only: %s', str(export_only))
+            
+            try:
+                response = rds_client.start_export_task(
+                ExportTaskIdentifier=export_task_id,
+                SourceArn=source_arn,
+                S3BucketName=s3_bucket,
+                IamRoleArn=str(iam_role),
+                KmsKeyId=str(kms_key),
+                S3Prefix=''.join(s3_prefix),
+                ExportOnly=export_only)
+            except ClientError as e:
+              logger.error('ERROR: Could not start export task.')
+              logger.error(e)
+              sys.exit()
+              
+            logger.info('SUCCESS: Export Task started.')
+
+  BackupCompletedEventPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ProcessBackupCompletionNotification
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt BackupCompletedEvent.Arn
+
+  ExportCompletedEventPermission:
+    Type: AWS::Lambda::Permission
+    Condition: RunGlueCrawlerCondition
+    Properties:
+      FunctionName: !Ref ProcessRdsExportCompletedNotification
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ExportCompletedEvent.Arn
+
+##SNS/////
+  RdsExportFailedTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: "Rds Export Failed"
+      FifoTopic: false
+      TopicName: !Join ['-', ['AutoExportDB-export-failed', !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+      KmsMasterKeyId: !If [CreateKmsKeyCondition, !Ref KmsKey, !Ref KmsKeyId]
+      
+
+  RdsExportFailedTopicSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !Ref NotificationEmail
+      Protocol: email
+      TopicArn: !Ref RdsExportFailedTopic
+
+##EventBridge/////
+  BackupCompletedEvent:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Triggered after any RDS Backup Completed
+      EventBusName: default
+      EventPattern:
+        detail-type:
+          - Backup Job State Change
+        source:
+          - aws.backup
+        detail:
+          backupVaultName:
+            - !Ref BackupVault
+          state:
+            - COMPLETED
+          resourceType:
+            - RDS
+            - Aurora
+      Name: !Join ['-', ['AutoExportDB-backup-completed', !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+      State: ENABLED
+      Targets:
+        -
+          Arn: !GetAtt ProcessBackupCompletionNotification.Arn
+          Id: !Join ['-', ['AutoExportDB-backup-completed', !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+
+  ExportCompletedEvent:
+    Type: AWS::Events::Rule
+    Condition: RunGlueCrawlerCondition
+    Properties:
+      Description: Triggered after any RDS Export Completed
+      EventPattern:
+        source:
+          - aws.rds
+        detail:
+          EventID:
+            - RDS-EVENT-0161
+            - RDS-EVENT-0164
+      Name: !Join ['-', ['AutoExportDB-export-completed', !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+      State: "ENABLED"
+      Targets:
+       - 
+        Arn: !GetAtt ProcessRdsExportCompletedNotification.Arn
+        Id: !Join ['-', ['AutoExportDB-export-completed', !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+  
+  ExportFailedEvent:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Triggered after any RDS Export Failed
+      EventPattern:
+        source:
+          - aws.rds
+        detail:
+          EventID:
+            - RDS-EVENT-0159
+            - RDS-EVENT-0162
+      State: "ENABLED"
+      Name: !Join ['-', ['AutoExportDB-export-failed', !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+      Targets:
+       - 
+        Arn: 
+          !Ref RdsExportFailedTopic
+        Id: "RdsExportFailedTopic"
+  
+  EventTopicPolicy:
+    Type: 'AWS::SNS::TopicPolicy'
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: 'sns:Publish'
+            Resource: '*'
+      Topics:
+        - !Ref RdsExportFailedTopic
