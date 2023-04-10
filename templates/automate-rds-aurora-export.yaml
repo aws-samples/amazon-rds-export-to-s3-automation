@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT-0
 
 AWSTemplateFormatVersion: 2010-09-09
-
+Description: This template deploys a serverless event-driven solution that integrates AWS Backup with the Amazon RDS export feature to automate export tasks and enables you to query the data using Amazon Athena without provisioning a new RDS instance or Aurora cluster.
 Metadata: 
   AWS::CloudFormation::Interface: 
     ParameterGroups: 
