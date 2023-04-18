@@ -1,4 +1,4 @@
-# Reduce RDS Backup costs by automating exports to Amazon S3
+# Reduce data archiving costs for compliance by automating RDS snapshot exports to Amazon S3
 
 This repository contains a CloudFormation template which deploys a serverless event-driven solution that integrates AWS Backup with the Amazon RDS export feature to automate export tasks and enables you to query the data using Amazon Athena without provisioning a new RDS instance or Aurora cluster.
 
