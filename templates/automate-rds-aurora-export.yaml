@@ -417,7 +417,6 @@ Resources:
         Variables:
           GLUE_IAM_ROLE_ARN: !GetAtt GlueRole.Arn
           S3_BUCKET_NAME: !Join ['-', ['autoexportdb', !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
-
           LOG_LEVEL: 'INFO'
       Code:
         ZipFile: |
